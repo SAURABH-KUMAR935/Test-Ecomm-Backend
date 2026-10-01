@@ -5,7 +5,7 @@ const { protect, admin } = require('../middleware/authMiddleware');
 
 const router = express.Router();
 const multer = require('multer');
-const upload = multer({ dest: 'uploads/' }); // Set the destination folder for uploaded files
+const upload = multer({ dest: '/tmp/' });
 
 
 router.route('/').get(getAllProducts).post(protect, admin, upload.single('image'), createProduct);

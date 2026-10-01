@@ -1,24 +1,8 @@
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
-const jwt = require('jsonwebtoken');
+const RegistrationOtp = require('../models/RegistrationOtp');
+const generateToken = require('../utils/generateToken');
 const sendEmail = require('../utils/sendEmail');
-
-const generateToken = (id) =>{
-  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-}
-
-// Simple in-memory OTP storage (in production, use Redis or database)
-const otpStorage = new Map();
-
-// Clean up expired OTPs every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [email, data] of otpStorage.entries()) {
-    if (data.expiresAt < now) {
-      otpStorage.delete(email);
-    }
-  }
-}, 5 * 60 * 1000);
 
 exports.register = async (req, res) => {
   try {
@@ -29,30 +13,28 @@ exports.register = async (req, res) => {
       return res.status(400).json({ message: "User already exists" });
     }
     
-    // Generate 6-digit OTP
     const generatedOtp = Math.floor(100000 + Math.random() * 900000);
-    
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    // Store OTP with 10-minute expiration
-    otpStorage.set(email, {
-      otp: generatedOtp,
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+    await RegistrationOtp.findOneAndUpdate({ email }, {
+      otpHash: await bcrypt.hash(String(generatedOtp), 10),
+      passwordHash: await bcrypt.hash(password, 10),
+      expiresAt,
       username: username || email.split('@')[0],
-      password: password,
-      role: 'user' // Default to user role
-    });
-    
-    // Send OTP to email
-    const Message = `Your OTP for email verification is: ${generatedOtp}. This OTP will expire in 10 minutes.`;
-    await sendEmail(email, "Email Verification", Message);
-    
-    // For development/testing, return the OTP in response
-    // Remove this in production!
-    res.status(200).json({ 
+      role: 'user',
+    }, { upsert: true, new: true, runValidators: true });
+
+    const message = `Your OTP for email verification is: ${generatedOtp}. This OTP will expire in 10 minutes.`;
+    await sendEmail(email, 'Email Verification', message);
+
+    const response = {
       message: "OTP sent to email",
-      otp: generatedOtp, // Remove this in production!
-      email 
-    });
+      email,
+    };
+    if (process.env.NODE_ENV !== 'production') {
+      response.otp = generatedOtp;
+    }
+    res.status(200).json(response);
   } catch (error) {
     
     if (error.code === 11000) {
@@ -67,46 +49,35 @@ exports.verifyOtpAndRegister = async (req, res) => {
   try {
     const { email, otp } = req.body;
     
-    // Check if OTP exists in storage
-    const storedData = otpStorage.get(email);
-    
+    const storedData = await RegistrationOtp.findOne({ email });
+
     if (!storedData) {
       return res.status(400).json({ message: "OTP expired or not found. Please request a new OTP." });
     }
-    
-    // Check if OTP has expired
-    if (storedData.expiresAt < Date.now()) {
-      otpStorage.delete(email);
+
+    if (storedData.expiresAt < new Date()) {
+      await RegistrationOtp.deleteOne({ _id: storedData._id });
       return res.status(400).json({ message: "OTP expired. Please request a new OTP." });
     }
-    
-    // Verify OTP matches (convert both to string for comparison)
-    if (String(storedData.otp) !== String(otp)) {
-   
+
+    if (!(await bcrypt.compare(String(otp), storedData.otpHash))) {
       return res.status(400).json({ message: "Invalid OTP. Please try again." });
     }
-    
-    // Check if user already exists
+
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      otpStorage.delete(email);
+      await RegistrationOtp.deleteOne({ _id: storedData._id });
       return res.status(400).json({ message: "User already exists" });
     }
-    
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(storedData.password, salt);
-    
-    // Create user
+
     const user = await User.create({ 
       username: storedData.username, 
       email: email, 
-      password: hashedPassword,
+      password: storedData.passwordHash,
       role: storedData.role || 'user'
     });
-    
-    // Delete OTP from storage after successful registration
-    otpStorage.delete(email);
+
+    await RegistrationOtp.deleteOne({ _id: storedData._id });
     
     if(user) {
       res.status(201).json({

@@ -2,10 +2,9 @@
   "name": "ecommerce-server",
   "version": "1.0.0",
   "description": "E-commerce backend API",
-  "main": "src/server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
+    "start": "node server.js",
     "seed:test": "node scripts/seed-test-data.js"
   },
   "keywords": [
