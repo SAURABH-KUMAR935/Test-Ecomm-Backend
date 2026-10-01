@@ -1,6 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-const connectDB = require("./src/config/db");
+const connectDB = require("./config/db");
 
 const app = express();
 
@@ -21,11 +21,11 @@ app.use(async (req, res, next) => {
   }
 });
 
-app.use("/api/auth", require("./src/routes/authRoutes"));
-app.use("/api/products", require("./src/routes/productRoutes"));
-app.use("/api/cart", require("./src/routes/cartRoutes"));
-app.use("/api/orders", require("./src/routes/orderRoutes"));
-app.use("/api/analytics", require("./src/routes/analyticsRoutes"));
+app.use("/api/auth", require("./routes/authRoutes"));
+app.use("/api/products", require("./routes/productRoutes"));
+app.use("/api/cart", require("./routes/cartRoutes"));
+app.use("/api/orders", require("./routes/orderRoutes"));
+app.use("/api/analytics", require("./routes/analyticsRoutes"));
 
 app.get("/", (req, res) => {
   res.json({ message: "E-commerce API is running" });
