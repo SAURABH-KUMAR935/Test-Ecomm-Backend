@@ -474,6 +474,7 @@ exports.getUsers = async (req, res) => {
     res.json(users);
   } catch (error) {
     console.error('Failed to load users:', error);
-    sendServiceError(res, error, 'Unable to load users.');
+    sendServiceError(res, error, 'Unable to load users.')
   }
 };
+//up to date

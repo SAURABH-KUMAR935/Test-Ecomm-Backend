@@ -52,7 +52,7 @@ exports.addToCart = async (req, res) => {
       });
     }
     
-    // Check if item already exists in cart
+    // Check if item already exists in cart =====
     const existingItemIndex = cart.items.findIndex(
       item => item.product.toString() === productId
     );
