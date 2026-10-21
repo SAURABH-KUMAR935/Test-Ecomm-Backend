@@ -14,9 +14,24 @@ const registrationOtpSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  attempts: {
+    type: Number,
+    default: 0,
+    min: 0,
+  },
   username: {
     type: String,
     required: true,
+  },
+  fullName: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  phone: {
+    type: String,
+    default: '',
+    trim: true,
   },
   role: {
     type: String,

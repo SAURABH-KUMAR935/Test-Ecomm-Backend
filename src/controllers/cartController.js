@@ -1,5 +1,6 @@
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
+const { sendServiceError } = require('../utils/serviceErrors');
 
 // Get user's cart
 exports.getCart = async (req, res) => {
@@ -12,7 +13,8 @@ exports.getCart = async (req, res) => {
     
     res.json(cart);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Failed to get cart:', error);
+    sendServiceError(res, error, 'Unable to load your cart.');
   }
 };
 
@@ -20,6 +22,15 @@ exports.getCart = async (req, res) => {
 exports.addToCart = async (req, res) => {
   try {
     const { productId, quantity } = req.body;
+    if (
+      typeof productId !== 'string'
+      || !/^[a-f\d]{24}$/i.test(productId)
+      || !Number.isInteger(quantity)
+      || quantity < 1
+      || quantity > 100
+    ) {
+      return res.status(400).json({ message: 'Provide a valid product and quantity.' });
+    }
     
     // Check if product exists and has enough stock
     const product = await Product.findById(productId);
@@ -66,7 +77,8 @@ exports.addToCart = async (req, res) => {
     
     res.json(cart);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Failed to update cart:', error);
+    sendServiceError(res, error, 'Unable to update your cart.');
   }
 };
 
@@ -74,6 +86,15 @@ exports.addToCart = async (req, res) => {
 exports.updateCartItem = async (req, res) => {
   try {
     const { productId, quantity } = req.body;
+    if (
+      typeof productId !== 'string'
+      || !/^[a-f\d]{24}$/i.test(productId)
+      || !Number.isInteger(quantity)
+      || quantity < 0
+      || quantity > 100
+    ) {
+      return res.status(400).json({ message: 'Provide a valid product and quantity.' });
+    }
     
     const cart = await Cart.findOne({ user: req.user._id });
     if (!cart) {
@@ -90,6 +111,9 @@ exports.updateCartItem = async (req, res) => {
     
     // Check stock
     const product = await Product.findById(productId);
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
     if (quantity > product.countInStock) {
       return res.status(400).json({ message: 'Insufficient stock' });
     }
@@ -105,7 +129,8 @@ exports.updateCartItem = async (req, res) => {
     
     res.json(cart);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Failed to update cart item:', error);
+    sendServiceError(res, error, 'Unable to update the cart item.');
   }
 };
 
@@ -128,7 +153,8 @@ exports.removeFromCart = async (req, res) => {
     
     res.json(cart);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Failed to remove cart item:', error);
+    sendServiceError(res, error, 'Unable to remove the cart item.');
   }
 };
 
@@ -145,6 +171,7 @@ exports.clearCart = async (req, res) => {
     
     res.json({ message: 'Cart cleared successfully', cart });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Failed to clear cart:', error);
+    sendServiceError(res, error, 'Unable to clear your cart.');
   }
 };

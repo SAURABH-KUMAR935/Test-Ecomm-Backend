@@ -1,4 +1,5 @@
 const Order = require('../models/Order');
+const { sendServiceError } = require('../utils/serviceErrors');
 const Product = require('../models/Product');
 const User = require('../models/User');
 
@@ -19,7 +20,7 @@ const getDateRange = (query) => {
     if (Number.isNaN(to.getTime())) return null;
     // A date-only `to` value includes the whole final day.
     if (/^\d{4}-\d{2}-\d{2}$/.test(query.to)) {
-      to.setHours(23, 59, 59, 999);
+      to.setUTCHours(23, 59, 59, 999);
     }
     range.$lte = to;
   }
@@ -105,7 +106,7 @@ exports.getOverview = async (req, res) => {
           ],
           recentOrders: [
             { $sort: { createdAt: -1 } },
-            { $limit: 5 },
+            { $limit: 100 },
             {
               $project: {
                 _id: 1,
@@ -113,6 +114,38 @@ exports.getOverview = async (req, res) => {
                 status: 1,
                 createdAt: 1,
                 itemCount: { $sum: '$items.quantity' },
+              },
+            },
+          ],
+          topProducts: [
+            { $match: { status: { $in: salesStatuses } } },
+            { $unwind: '$items' },
+            { $match: { 'items.product': { $ne: null } } },
+            {
+              $group: {
+                _id: '$items.product',
+                sold: { $sum: '$items.quantity' },
+                revenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } },
+              },
+            },
+            { $sort: { sold: -1, revenue: -1 } },
+            { $limit: 10 },
+            {
+              $lookup: {
+                from: 'products',
+                localField: '_id',
+                foreignField: '_id',
+                as: 'product',
+              },
+            },
+            { $unwind: '$product' },
+            {
+              $project: {
+                _id: '$product._id',
+                name: '$product.name',
+                category: '$product.category',
+                sold: 1,
+                revenue: 1,
               },
             },
           ],
@@ -138,16 +171,19 @@ exports.getOverview = async (req, res) => {
       statusBreakdown: analytics.statusBreakdown,
       salesByMonth: analytics.salesByMonth,
       recentOrders: analytics.recentOrders,
+      topProducts: analytics.topProducts,
     });
   } catch (error) {
-  
-    res.status(500).json({ message: 'Unable to load analytics.' });
+    console.error('Failed to load analytics overview:', error);
+    sendServiceError(res, error, 'Unable to load analytics.');
   }
 };
 
 exports.getBasicAnalytics = async (req, res) => {
   try {
-    
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const nextMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
 
     const totalSales = await Order.aggregate([
       { $match: { status: { $in: salesStatuses } } },
@@ -157,6 +193,49 @@ exports.getBasicAnalytics = async (req, res) => {
     const totalOrders = await Order.countDocuments();
     const totalProducts = await Product.countDocuments();
     const totalUsers = await User.countDocuments();
+    const [monthlyStats] = await Order.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: monthStart, $lt: nextMonthStart },
+        },
+      },
+      {
+        $facet: {
+          orders: [
+            {
+              $group: {
+                _id: null,
+                totalOrders: { $sum: 1 },
+                customers: { $addToSet: '$user' },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                totalOrders: 1,
+                totalCustomers: { $size: '$customers' },
+              },
+            },
+          ],
+          sales: [
+            { $match: { status: { $in: salesStatuses } } },
+            {
+              $group: {
+                _id: null,
+                totalSales: { $sum: '$totalAmount' },
+              },
+            },
+            { $project: { _id: 0, totalSales: 1 } },
+          ],
+          unitsSold: [
+            { $match: { status: { $in: salesStatuses } } },
+            { $unwind: '$items' },
+            { $group: { _id: null, totalUnitsSold: { $sum: '$items.quantity' } } },
+            { $project: { _id: 0, totalUnitsSold: 1 } },
+          ],
+        },
+      },
+    ]);
 
     const successfulOrders = await Order.countDocuments({ status: { $in: salesStatuses } });
 
@@ -225,6 +304,13 @@ exports.getBasicAnalytics = async (req, res) => {
       averageOrderValue: averageOrderValue[0]?.avgValue || 0,
       totalCustomers: totalCustomers[0]?.totalCustomers || 0,
       totalUnitsSold: totalUnitsSold[0]?.totalUnits || 0,
+      monthlyStats: {
+        month: monthStart.toISOString().slice(0, 7),
+        totalSales: monthlyStats.sales[0]?.totalSales || 0,
+        totalOrders: monthlyStats.orders[0]?.totalOrders || 0,
+        totalCustomers: monthlyStats.orders[0]?.totalCustomers || 0,
+        totalUnitsSold: monthlyStats.unitsSold[0]?.totalUnitsSold || 0,
+      },
       recentOrders,
       topProducts
     };
@@ -232,7 +318,7 @@ exports.getBasicAnalytics = async (req, res) => {
     
     res.json(analyticsData);
   } catch (error) {
-   
-    res.status(500).json({ message: 'Unable to load analytics.' });
+    console.error('Failed to load basic analytics:', error);
+    sendServiceError(res, error, 'Unable to load analytics.');
   }
 };

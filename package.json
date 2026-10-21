@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
+    "worker:signup-email": "node src/workers/signupEmailWorker.js",
     "seed:test": "node scripts/seed-test-data.js"
   },
   "keywords": [
@@ -18,21 +19,17 @@
   "license": "ISC",
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "cloudinary": "^1.41.3",
+    "cloudinary": "^2.11.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "express-rate-limit": "^7.1.5",
     "express-validator": "^7.0.1",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.0",
     "multer": "^1.4.5-lts.1",
-    "multer-storage-cloudinary": "^4.0.0",
-    "nodemailer": "^6.9.7",
+    "nodemailer": "^10.1.2",
+    "nodemon": "^3.1.14",
     "stripe": "^14.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
   }
 }

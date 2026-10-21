@@ -1,63 +1,279 @@
 const Order = require('../models/Order');
 const Product = require('../models/Product');
+const mongoose = require('mongoose');
 const sendEmail = require('../utils/sendEmail');
+const cloudinary = require('../config/cloudinary');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+const {
+  DEFAULT_CUSTOM_FRAME_PRICES,
+  calculateCustomFramePricing,
+  validateFrameOrientation,
+} = require('../utils/customFramePricing');
+const getCustomFramePrices = require('../utils/getCustomFramePrices');
+const indianStates = require('../utils/indianStates');
+const { markServiceError, sendServiceError } = require('../utils/serviceErrors');
 
 exports.getAllOrders = async (req, res) => {
   try {
     const orders = await Order.find().populate('user', 'id name email');
     res.json(orders);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Failed to load orders:', error);
+    sendServiceError(res, error, 'Unable to load orders.');
   }
 }
 
 exports.createOrder = async (req, res) => {
-  const { items, totalAmount, address, paymentId } = req.body;
+  const { items, address, paymentId } = req.body;
+  if (!Array.isArray(items) || items.length === 0 || !address || !paymentId) {
+    return res.status(400).json({ message: 'All fields are required' });
+  }
+  if (items.length > 50) {
+    return res.status(400).json({ message: 'An order cannot contain more than 50 items.' });
+  }
+  if (paymentId !== 'UPI') {
+    return res.status(400).json({ message: 'Unsupported payment method.' });
+  }
+  if (
+    typeof address.fullName !== 'string' ||
+    !address.fullName.trim() ||
+    typeof address.street !== 'string' ||
+    !address.street.trim() ||
+    typeof address.city !== 'string' ||
+    !address.city.trim() ||
+    !indianStates.includes(address.state) ||
+    typeof address.postalCode !== 'string' ||
+    !address.postalCode.trim() ||
+    (address.landmark != null && typeof address.landmark !== 'string')
+  ) {
+    return res.status(400).json({ message: 'Please provide a valid name and complete shipping address, including state.' });
+  }
+  if ((address.landmark || '').length > 120) {
+    return res.status(400).json({ message: 'Landmark must be 120 characters or fewer.' });
+  }
+
+  const customFrameItems = [];
+  let customFrameTotal = 0;
+  const requestedQuantities = new Map();
+  let customFramePrices = DEFAULT_CUSTOM_FRAME_PRICES;
+  if (items.some((item) => item?.isCustomFrame)) {
+    try {
+      customFramePrices = await getCustomFramePrices();
+    } catch (error) {
+      console.error('Failed to load custom-frame pricing for order:', error);
+      return sendServiceError(res, error, 'Unable to calculate custom-frame pricing.');
+    }
+  }
+
+  for (const item of items) {
+    if (!item || !Number.isInteger(item.quantity) || item.quantity < 1) {
+      return res.status(400).json({ message: 'Each item must have a positive quantity.' });
+    }
+
+    if (item.isCustomFrame) {
+      const expectedPhotoPrefix = `zavique-art/custom-frames/${req.user._id}/`;
+      const submittedPhotos = Array.isArray(item.photos)
+        ? item.photos
+        : [{ photoPublicId: item.photoPublicId, photoFormat: item.photoFormat }];
+      if (submittedPhotos.length < 1 || submittedPhotos.length > 5) {
+        return res.status(400).json({ message: 'Custom frames must include between 1 and 5 photos.' });
+      }
+      const photos = [];
+      for (const photo of submittedPhotos) {
+        const photoPublicId = photo?.photoPublicId;
+        if (
+          typeof photoPublicId !== 'string'
+          || !photoPublicId.startsWith(expectedPhotoPrefix)
+          || !/^[a-zA-Z0-9_-]+$/.test(photoPublicId.slice(expectedPhotoPrefix.length))
+        ) {
+          return res.status(400).json({ message: 'Upload your photo before ordering a custom frame.' });
+        }
+        photos.push({
+          photoPublicId,
+          photoFormat: typeof photo.photoFormat === 'string' ? photo.photoFormat.toLowerCase() : '',
+          imageUrl: cloudinary.url(photoPublicId, { secure: true, resource_type: 'image' }),
+        });
+      }
+      const { photoPublicId, photoFormat, imageUrl } = photos[0];
+      let referenceFrame = null;
+      if (item.referenceFrame != null) {
+        const referencePhotoPublicId = item.referenceFrame.photoPublicId;
+        if (
+          typeof referencePhotoPublicId !== 'string'
+          || !referencePhotoPublicId.startsWith(expectedPhotoPrefix)
+          || !/^[a-zA-Z0-9_-]+$/.test(referencePhotoPublicId.slice(expectedPhotoPrefix.length))
+        ) {
+          return res.status(400).json({ message: 'Upload a valid reference frame image before ordering.' });
+        }
+        referenceFrame = {
+          photoPublicId: referencePhotoPublicId,
+          photoFormat: typeof item.referenceFrame.photoFormat === 'string'
+            ? item.referenceFrame.photoFormat.toLowerCase()
+            : '',
+          imageUrl: cloudinary.url(referencePhotoPublicId, { secure: true, resource_type: 'image' }),
+        };
+      }
+      const { frameSize, frameColor, orientation } = item;
+      const photoLayout = item.photoLayout || 'single';
+      let price;
+      try {
+        validateFrameOrientation(orientation);
+        price = calculateCustomFramePricing({
+          frameSize,
+          frameColor,
+          quantity: item.quantity,
+          photoLayout,
+        }, customFramePrices);
+      } catch (error) {
+        return res.status(400).json({ message: error.message });
+      }
+      const personalizedMessage = typeof item.personalizedMessage === 'string'
+        ? item.personalizedMessage.trim()
+        : '';
+      if (personalizedMessage.length > 200) {
+        return res.status(400).json({ message: 'Personalized messages must be 200 characters or fewer.' });
+      }
+
+      const customFrameDetails = {
+        name: 'Custom Framed Photo',
+        imageUrl,
+        photoPublicId,
+        photoFormat,
+        photos,
+        referenceFrame,
+        frameSize: price.frameSize,
+        frameColor: price.frameColor,
+        photoLayout: price.photoLayout,
+        orientation,
+        personalizedMessage,
+        quantity: price.quantity,
+      };
+
+      customFrameItems.push({
+        name: customFrameDetails.name,
+        quantity: price.quantity,
+        price: price.unitPrice,
+        isCustomFrame: true,
+        customFrame: customFrameDetails,
+      });
+      customFrameTotal += price.totalPrice;
+      continue;
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(item.product)) {
+      return res.status(400).json({ message: 'Each standard item must include a valid product id.' });
+    }
+
+    const productId = new mongoose.Types.ObjectId(item.product).toString();
+    requestedQuantities.set(productId, (requestedQuantities.get(productId) || 0) + item.quantity);
+  }
+
+  let order;
+  let session;
   try {
-    if(!items || items.length === 0 || !totalAmount || !address || !paymentId) {
-      return res.status(400).json({ message: 'All fields are required' });
-    }
-    const order = await Order.create({
-      user: req.user._id,
-      items,
-      totalAmount,
-      address,
-      paymentId
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const orderItems = [...customFrameItems];
+      let computedTotalAmount = customFrameTotal;
+      let shippingTotal = 0;
+      const productIds = [...requestedQuantities.keys()];
+      const products = await Product.find({ _id: { $in: productIds } }).session(session);
+      const productsById = new Map(products.map((product) => [product._id.toString(), product]));
+
+      if (productIds.length && productsById.size !== productIds.length) {
+        const error = new Error('One or more products could not be found');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      for (const [productId, quantity] of requestedQuantities) {
+        const product = productsById.get(productId);
+        const inventoryUpdate = await Product.updateOne(
+          { _id: productId, countInStock: { $gte: quantity } },
+          { $inc: { countInStock: -quantity } },
+          { session }
+        );
+
+        if (inventoryUpdate.modifiedCount !== 1) {
+          const error = new Error(`Not enough stock available for ${product.name}`);
+          error.statusCode = 409;
+          error.availableStock = product.countInStock;
+          error.requestedQuantity = quantity;
+          throw error;
+        }
+
+        orderItems.push({
+          product: product._id,
+          name: product.name,
+          imageUrl: product.imageUrl || '',
+          quantity,
+          price: product.price,
+          shippingCharge: product.shippingCharge || 0,
+          isCustomFrame: false,
+        });
+        computedTotalAmount += product.price * quantity;
+        shippingTotal += product.shippingCharge || 0;
+      }
+
+      [order] = await Order.create([{
+        user: req.user._id,
+        items: orderItems,
+        totalAmount: computedTotalAmount + shippingTotal,
+        address,
+        paymentId,
+        inventoryDeducted: true,
+      }], { session });
     });
-    
-    // Fetch product details for the order items
-    const orderWithProducts = await Order.findById(order._id).populate('items.product');
-    
-    // Create detailed order message with product names
-    let itemsList = '';
-    if (orderWithProducts && orderWithProducts.items) {
-      itemsList = orderWithProducts.items.map((item, index) => {
-        const productName = item.product && item.product.name ? item.product.name : 'Unknown Product';
-        return `- Item ${index + 1}: ${productName} (Quantity: ${item.quantity}, Price: ₹${item.price || 'N/A'})`;
-      }).join('\n');
-    }
-    
-    const message = `New order created by ${req.user.username} (${req.user.email})
+
+    try {
+      const orderWithProducts = await Order.findById(order._id).populate('items.product');
+      const itemsList = orderWithProducts?.items?.map((item, index) => {
+        const productName = item.product?.name || item.name || 'Custom framed photo';
+        return `- Item ${index + 1}: ${productName} (Quantity: ${item.quantity}, Price: ₹${item.price || 'N/A'}, Shipping: ₹${item.shippingCharge || 0})`;
+      }).join('\n') || '';
+
+      const message = `New order created by ${req.user.username} (${req.user.email})
 
 Order ID: ${order._id.toString()}
 Order Status: ${order.status}
-Payment ID: ${paymentId}
+Payment Method: ${paymentId}
 
 Order Items:
 ${itemsList}
 
-Total Amount: ₹${totalAmount}
+Total Amount: ₹${order.totalAmount}
 
 Shipping Address:
 Name: ${address.fullName}
 Street: ${address.street}
+Landmark: ${address.landmark || 'Not provided'}
 City: ${address.city}
+State: ${address.state}
 Postal Code: ${address.postalCode}`;
-   
-    await sendEmail(req.user.email, 'Order Confirmation', message);
+      await sendEmail(req.user.email, 'Order Confirmation', message);
+    } catch (emailError) {
+      console.error('Order created but confirmation email failed:', emailError);
+    }
     res.status(201).json(order);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    if (error.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({
+        message: error.availableStock !== undefined
+          ? `${error.message}. Available: ${error.availableStock}; requested: ${error.requestedQuantity}.`
+          : error.message,
+        ...(error.availableStock !== undefined && {
+          availableStock: error.availableStock,
+          requestedQuantity: error.requestedQuantity,
+        }),
+      });
+    }
+    console.error('Order creation failed:', error);
+    sendServiceError(res, error, 'Unable to place the order.');
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
   }
 }
 
@@ -66,31 +282,183 @@ exports.myorders = async (req, res) => {
     const orders = await Order.find({ user: req.user._id }).populate('items.product');
     res.json(orders);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Failed to load user orders:', error);
+    sendServiceError(res, error, 'Unable to load your orders.');
   }
 }
 
 exports.getOrderById = async (req, res) => {
   try {
-    const order = await Order.findById(req.params.id).populate('user', 'username email').populate('items.product');
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid order id.' });
+    }
+
+    const order = await Order.findById(req.params.id)
+      .populate('user', 'username fullName email phone')
+      .populate('items.product');
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
+
+    const orderUserId = order.user?._id?.toString() || order.user?.toString();
+    if (req.user.role !== 'admin' && orderUserId !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'You are not authorized to view this order.' });
+    }
+
     res.json(order);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Failed to load order:', error);
+    sendServiceError(res, error, 'Unable to load this order.');
   }
 }
 
-exports.updateOrderStatus = async (req, res) => {
+exports.downloadCustomFramePhoto = async (req, res) => {
   try {
-    const { status } = req.body;
-  
-    const order = await Order.findById(req.params.id).populate('user', 'username email');
-    if (order) {
-      const oldStatus = order.status;
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid order id.' });
+    }
+
+    const order = await Order.findById(req.params.id).select('items');
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+
+    const itemIndex = Number(req.params.itemIndex);
+    if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= order.items.length) {
+      return res.status(404).json({ message: 'Order item not found.' });
+    }
+
+    const customFrame = order.items[itemIndex]?.customFrame;
+    if (!order.items[itemIndex]?.isCustomFrame) {
+      return res.status(404).json({ message: 'No original customer photo is available for this item.' });
+    }
+    if (req.query.photoType === 'reference-frame') {
+      const referenceFrame = customFrame?.referenceFrame;
+      if (!referenceFrame?.photoPublicId) {
+        return res.status(404).json({ message: 'No reference frame image is available for this item.' });
+      }
+      const originalPhotoUrl = cloudinary.url(referenceFrame.photoPublicId, {
+        secure: true,
+        resource_type: 'image',
+        type: 'upload',
+      });
+      let photoResponse;
+      try {
+        photoResponse = await fetch(originalPhotoUrl);
+      } catch (error) {
+        throw markServiceError(error, 'image');
+      }
+      if (!photoResponse.ok || !photoResponse.body) {
+        console.error('Cloudinary reference frame download failed:', photoResponse.status);
+        return res.status(502).json({ message: 'Unable to retrieve the reference frame image from Cloudinary.' });
+      }
+
+      const extension = ['jpg', 'jpeg', 'png', 'webp'].includes(referenceFrame.photoFormat)
+        ? referenceFrame.photoFormat
+        : 'jpg';
+      const filename = `custom-frame-reference-${order._id.toString().slice(-8)}-${itemIndex + 1}.${extension}`;
+      res.setHeader('Content-Type', photoResponse.headers.get('content-type') || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      const contentLength = photoResponse.headers.get('content-length');
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+      await pipeline(Readable.fromWeb(photoResponse.body), res);
+      return;
+    }
+    const photos = customFrame?.photos?.length
+      ? customFrame.photos
+      : [{ photoPublicId: customFrame?.photoPublicId, photoFormat: customFrame?.photoFormat }];
+    const photoIndex = req.query.photoIndex == null ? 0 : Number(req.query.photoIndex);
+    if (
+      !Number.isInteger(photoIndex)
+      || photoIndex < 0
+      || photoIndex >= photos.length
+      || !photos[photoIndex]?.photoPublicId
+    ) {
+      return res.status(404).json({ message: 'No original customer photo is available for this item.' });
+    }
+    const photo = photos[photoIndex];
+
+    const originalPhotoUrl = cloudinary.url(photo.photoPublicId, {
+      secure: true,
+      resource_type: 'image',
+      type: 'upload',
+    });
+    let photoResponse;
+    try {
+      photoResponse = await fetch(originalPhotoUrl);
+    } catch (error) {
+      throw markServiceError(error, 'image');
+    }
+    if (!photoResponse.ok || !photoResponse.body) {
+      console.error('Cloudinary original photo download failed:', photoResponse.status);
+      return res.status(502).json({ message: 'Unable to retrieve the original customer photo from Cloudinary.' });
+    }
+
+    const extension = ['jpg', 'jpeg', 'png', 'webp'].includes(photo.photoFormat)
+      ? photo.photoFormat
+      : 'jpg';
+    const filename = `custom-frame-${order._id.toString().slice(-8)}-${itemIndex + 1}-${photoIndex + 1}.${extension}`;
+    res.setHeader('Content-Type', photoResponse.headers.get('content-type') || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    const contentLength = photoResponse.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    await pipeline(Readable.fromWeb(photoResponse.body), res);
+  } catch (error) {
+    console.error('Original customer photo download failed:', error);
+    if (!res.headersSent) {
+      if (error?.service === 'image' || mongoose.connection.readyState !== 1) {
+        return sendServiceError(res, error, 'Unable to download the original customer photo.');
+      }
+      return res.status(502).json({ message: 'Unable to download the original customer photo.' });
+    }
+    return res.end();
+  }
+};
+
+exports.updateOrderStatus = async (req, res) => {
+  const { status } = req.body;
+  const allowedStatuses = ['pending', 'paid', 'confirmed', 'printing', 'framing', 'shipped', 'delivered', 'cancelled'];
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({ message: 'Invalid order status.' });
+  }
+
+  let session;
+  let order;
+  let oldStatus;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      order = await Order.findById(req.params.id).session(session);
+      if (!order) {
+        return;
+      }
+
+      oldStatus = order.status;
       order.status = status;
-      await order.save();
+
+      if (status === 'cancelled' && order.inventoryDeducted && !order.inventoryRestocked) {
+        for (const item of order.items) {
+          await Product.updateOne(
+            { _id: item.product },
+            { $inc: { countInStock: item.quantity } },
+            { session }
+          );
+        }
+        order.inventoryRestocked = true;
+      }
+
+      await order.save({ session });
+    });
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    order = await Order.findById(order._id).populate('user', 'username email');
+    if (order) {
       
 
       // Send email when order is delivered
@@ -242,7 +610,7 @@ exports.updateOrderStatus = async (req, res) => {
           await sendEmail(order.user.email, emailSubject, emailText, emailHtml);
     
         } catch (emailError) {
-          res.status(500).json({ message: 'Failed to send cancellation email' });
+          console.error('Order cancelled but cancellation email failed:', emailError);
         }
       }
 
@@ -252,8 +620,12 @@ exports.updateOrderStatus = async (req, res) => {
       res.status(404).json({ message: 'Order not found' });
     }
   } catch (error) {
-    
-    res.status(500).json({ message: error.message });
+    console.error('Failed to update order status:', error);
+    sendServiceError(res, error, 'Unable to update the order status.');
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
   }
 }
 
@@ -265,7 +637,7 @@ exports.deleteOrder = async (req, res) => {
     }
     res.json({ message: 'Order deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Failed to delete order:', error);
+    sendServiceError(res, error, 'Unable to delete the order.');
   }
 }
-

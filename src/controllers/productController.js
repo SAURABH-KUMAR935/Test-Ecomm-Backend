@@ -1,8 +1,41 @@
 const Product = require('../models/Product');
-const multer = require('multer');
 const cloudinary = require('../config/cloudinary');
 const fs = require('fs');
 const path = require('path');
+const isValidImageUpload = require('../utils/validateImageUpload');
+const { markServiceError, sendServiceError } = require('../utils/serviceErrors');
+
+const validateProductInput = (body, partial = false) => {
+  const values = {};
+  const textLimits = { name: 200, description: 10000, category: 100 };
+
+  for (const [field, maxLength] of Object.entries(textLimits)) {
+    if (partial && body[field] === undefined) continue;
+    const value = body[field];
+    if (typeof value !== 'string' || !value.trim() || value.trim().length > maxLength) {
+      return { error: `${field} must be a non-empty string of at most ${maxLength} characters.` };
+    }
+    values[field] = value.trim();
+  }
+
+  for (const field of ['price', 'countInStock', 'shippingCharge']) {
+    if (partial && body[field] === undefined) continue;
+    const rawValue = body[field];
+    if (
+      (typeof rawValue !== 'number' && typeof rawValue !== 'string')
+      || (typeof rawValue === 'string' && !rawValue.trim())
+    ) {
+      return { error: `${field} must be a valid non-negative number.` };
+    }
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value < 0 || (field === 'countInStock' && !Number.isInteger(value))) {
+      return { error: `${field} must be a valid non-negative ${field === 'countInStock' ? 'integer' : 'number'}.` };
+    }
+    values[field] = value;
+  }
+
+  return { values };
+};
 
 // Helper function to delete local file
 const deleteLocalFile = (filePath) => {
@@ -12,8 +45,31 @@ const deleteLocalFile = (filePath) => {
     
     }
   } catch (error) {
-   res.status(500).json({ message: "Failed to delete local file" });
+    console.error('Failed to delete temporary image:', error);
   }
+};
+
+const getProductImageFiles = (req) => [
+  ...(req.files?.image || (req.file ? [req.file] : [])),
+  ...(req.files?.additionalImages || []),
+];
+
+const cleanupProductImageFiles = (req) => {
+  getProductImageFiles(req).forEach((file) => deleteLocalFile(file.path));
+};
+
+const uploadProductImages = async (files) => {
+  if (files.some((file) => !isValidImageUpload(file))) {
+    return { error: 'The uploaded file must be a valid JPG, JPEG, PNG, or WEBP image.' };
+  }
+
+  let results;
+  try {
+    results = await Promise.all(files.map((file) => cloudinary.uploader.upload(file.path)));
+  } catch (error) {
+    throw markServiceError(error, 'image');
+  }
+  return { urls: results.map((result) => result.secure_url) };
 };
 
 // Helper function to clean up old unused images from uploads folder
@@ -40,14 +96,14 @@ const cleanupOldImages = async () => {
           fs.unlinkSync(filePath);
          
         } catch (error) {
-          res.status(500).json({ message: "Failed to delete old file" });
+          console.error('Failed to delete old uploaded file:', error);
         }
       }
     });
 
     
   } catch (error) {
-    res.status(500).json({ message: "Failed to cleanup old files" });
+    console.error('Failed to clean old uploaded files:', error);
   }
 };
 
@@ -56,52 +112,41 @@ exports.getAllProducts = async (req, res) => {
     const products = await Product.find();
     res.json(products);
   } catch (error) {
-    res.status(500).json({ message: "Server error" });
+    sendServiceError(res, error, 'Unable to load products.');
   }
 };
 
 exports.createProduct = async (req, res) => {
   try {
-    const { name, description, price, category, countInStock } = req.body;
-
-    let imageUrl = '';
-    if (req.file) {
-      try {
-        const result = await cloudinary.uploader.upload(req.file.path);
-        imageUrl = result.secure_url;
-        // Delete local file after successful Cloudinary upload
-        deleteLocalFile(req.file.path);
-      } catch (uploadError) {
-        
-        // Delete local file even if upload fails
-        deleteLocalFile(req.file.path);
-        return res.status(500).json({
-          message: "Image upload failed",
-          error: uploadError.message
-        });
-      }
+    const mainImage = req.files?.image?.[0] || req.file;
+    const additionalImages = req.files?.additionalImages || [];
+    const imageFiles = [...(mainImage ? [mainImage] : []), ...additionalImages];
+    const { values, error } = validateProductInput(req.body || {});
+    if (error) {
+      cleanupProductImageFiles(req);
+      return res.status(400).json({ message: error });
     }
+
+    const uploadedImages = await uploadProductImages(imageFiles);
+    if (uploadedImages.error) {
+      cleanupProductImageFiles(req);
+      return res.status(400).json({ message: uploadedImages.error });
+    }
+    cleanupProductImageFiles(req);
+
     const product = await Product.create({
-      name,
-      description,
-      price,
-      category,
-      imageUrl,
-      countInStock
+      ...values,
+      imageUrl: mainImage ? uploadedImages.urls[0] : '',
+      additionalImageUrls: uploadedImages.urls.slice(mainImage ? 1 : 0),
     });
     // Run cleanup after successful product creation
     cleanupOldImages();
     res.status(201).json(product);
   } catch (error) {
-    
+    console.error('Product creation failed:', error);
     // Clean up local file if product creation fails
-    if (req.file) {
-      deleteLocalFile(req.file.path);
-    }
-    res.status(500).json({
-    message: "Server error",
-    error: error.message
-  });
+    cleanupProductImageFiles(req);
+    sendServiceError(res, error, 'Unable to add the product.');
 
   }
 };
@@ -114,51 +159,47 @@ exports.getProductById = async (req, res) => {
     }
     res.json(product);
   } catch (error) {
-    res.status(500).json({ message: "Server error" });
+    sendServiceError(res, error, 'Unable to load this product.');
   }
 };
 
 exports.updateProduct = async (req, res) => {
   try {
-    const { name, description, price, category, countInStock } = req.body;
+    const mainImage = req.files?.image?.[0] || req.file;
+    const additionalImages = req.files?.additionalImages || [];
+    const imageFiles = [...(mainImage ? [mainImage] : []), ...additionalImages];
+    const { values, error } = validateProductInput(req.body || {}, true);
+    if (error) {
+      cleanupProductImageFiles(req);
+      return res.status(400).json({ message: error });
+    }
   
     const product = await Product.findById(req.params.id);
     if(product) {
-      product.name = name || product.name;
-      product.description = description || product.description;
-      product.price = price || product.price;
-      product.category = category || product.category;
-      product.countInStock = countInStock || product.countInStock;
-      if (req.file) {
-        try {
-          const result = await cloudinary.uploader.upload(req.file.path);
-          product.imageUrl = result.secure_url;
-          // Delete local file after successful Cloudinary upload
-          deleteLocalFile(req.file.path);
-        } catch (uploadError) {
-        
-          // Delete local file even if upload fails
-          deleteLocalFile(req.file.path);
-          return res.status(500).json({
-            message: "Image upload failed",
-            error: uploadError.message
-          });
-        }
+      Object.assign(product, values);
+      const uploadedImages = await uploadProductImages(imageFiles);
+      if (uploadedImages.error) {
+        cleanupProductImageFiles(req);
+        return res.status(400).json({ message: uploadedImages.error });
       }
+      if (mainImage) product.imageUrl = uploadedImages.urls[0];
+      if (additionalImages.length) {
+        product.additionalImageUrls = uploadedImages.urls.slice(mainImage ? 1 : 0);
+      }
+      cleanupProductImageFiles(req);
       const updatedProduct = await product.save();
       // Run cleanup after successful product update
       cleanupOldImages();
       res.json(updatedProduct);
     }else{
+      cleanupProductImageFiles(req);
       res.status(404).json({ message: "Product not found" });
     }
   } catch (error) {
-  
+    console.error('Product update failed:', error);
     // Clean up local file if product update fails
-    if (req.file) {
-      deleteLocalFile(req.file.path);
-    }
-    res.status(500).json({ message: "Server error" });
+    cleanupProductImageFiles(req);
+    sendServiceError(res, error, 'Unable to update the product.');
   }
 };
 
@@ -170,6 +211,6 @@ exports.deleteProduct = async (req, res) => {
     }
     res.json({ message: "Product deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server error" });
+    sendServiceError(res, error, 'Unable to delete the product.');
   }
 };
